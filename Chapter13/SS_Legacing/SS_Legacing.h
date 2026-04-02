@@ -1,0 +1,747 @@
+#pragma once
+
+// 2025-0729
+// using 관련 참조 바람
+
+// 2025-0801
+// OpenGL 관련 ENABLE_OPENGL 정의로 활성화
+
+// Smart Safer Legacing Header [Google의 Gemini(젬미니)와 협업작]
+// C 계열 동적생성 해제를 위한 스마트 포인터의 명시적 소멸자 호출을 도와주는 방식의 해더
+
+// OpenGL 관련 스마트 포인터 해제 기법 활성화
+// #define ENABLE_OPENGL
+
+#ifndef SSLEGACING_H
+#define SSLEGACING_H
+#include "framework.h" // 프로젝트의 기본 프레임워크 헤더 (tstring, WinAPI 등 정의)
+#include <memory>      // std::unique_ptr
+#include <set>         // std::set 사용을 위해
+#include <vector>      // std::vector 사용을 위해
+#include <type_traits> // std::underlying_type, std::is_enum_v (열거형 연산자 오버로딩을 위해)
+
+// malloc으로 할당된 메모리를 free할 사용자 정의 삭제자
+// 람다를 직접 사용할 수도 있지만, 이렇게 구조체로 정의하면
+// 타입이 명확하고 재사용성이 좋습니다.
+struct MallocDeleter {
+    void operator()(void* ptr) const {
+        if (ptr) {
+            free(ptr);
+        }
+    }
+};
+
+// 스마트 포인터 사용 DeleteObject 자동 호출 강화(제미나이[Gemini]의 도움)
+// GdiObjectDeleter 정의
+struct GdiObjectDeleter {
+    // 스톡 오브젝트 핸들을 저장할 정적(static) 집합 (최초 한 번 초기화)
+    static const std::set<HGDIOBJ>& GetStockObjectSet() {
+        static std::set<HGDIOBJ> stockObjects;
+        if (stockObjects.empty()) { // 한 번만 초기화
+            stockObjects.insert(GetStockObject(BLACK_BRUSH));
+            stockObjects.insert(GetStockObject(DKGRAY_BRUSH));
+            stockObjects.insert(GetStockObject(GRAY_BRUSH));
+            stockObjects.insert(GetStockObject(HOLLOW_BRUSH));
+            stockObjects.insert(GetStockObject(NULL_BRUSH));
+            stockObjects.insert(GetStockObject(LTGRAY_BRUSH));
+            stockObjects.insert(GetStockObject(WHITE_BRUSH));
+            stockObjects.insert(GetStockObject(BLACK_PEN));
+            stockObjects.insert(GetStockObject(NULL_PEN));
+            stockObjects.insert(GetStockObject(WHITE_PEN));
+            stockObjects.insert(GetStockObject(DEFAULT_PALETTE));
+            stockObjects.insert(GetStockObject(DEFAULT_GUI_FONT));
+            stockObjects.insert(GetStockObject(SYSTEM_FONT));
+            stockObjects.insert(GetStockObject(SYSTEM_FIXED_FONT));
+            stockObjects.insert(GetStockObject(ANSI_FIXED_FONT));
+            stockObjects.insert(GetStockObject(ANSI_VAR_FONT));
+            stockObjects.insert(GetStockObject(OEM_FIXED_FONT));
+            stockObjects.insert(GetStockObject(DEVICE_DEFAULT_FONT));
+            // 필요한 다른 스톡 오브젝트들을 여기에 추가
+        }
+        return stockObjects;
+    }
+
+    void operator()(HGDIOBJ hGdiObject) const {
+        if (!hGdiObject) {
+            return;
+        }
+
+        // 스톡 오브젝트 집합에 핸들이 존재하는지 확인
+        if (GetStockObjectSet().count(hGdiObject)) {
+            // 스톡 오브젝트이므로 해제하지 않습니다.
+            return;
+        }
+
+        // 위 조건에 해당하지 않는 경우에만 해제
+        ::DeleteObject(hGdiObject);
+    }
+};
+
+// GetDC()로 얻은 HDC를 위한 사용자 정의 삭제자
+// T는 HDC 타입, HWND는 해당 HDC를 얻어온 윈도우 핸들
+struct HdcDeleter {
+    HWND m_hWnd; // 해당 HDC를 얻어온 윈도우 핸들을 저장
+
+    HdcDeleter(HWND hWnd = nullptr) : m_hWnd(hWnd) {} // 생성자
+
+    void operator()(HDC hdc) const {
+        if (hdc && m_hWnd) {
+            ::ReleaseDC(m_hWnd, hdc); // GetDC()로 얻은 HDC는 ReleaseDC()로 해제
+        }
+    }
+};
+
+// HANDLE 계열 명시적 소멸자
+struct HandleDeleter
+{
+    void operator()(HANDLE h) const
+    {
+        if (h != INVALID_HANDLE_VALUE && h != nullptr) // NULL 체크도 하는 것이 안전
+        {
+            CloseHandle(h);
+        }
+    }
+};
+
+// LocalFree()를 호출하는 커스텀 삭제자 구조체입니다.
+// std::unique_ptr의 두 번째 템플릿 인자로 사용됩니다.
+struct LocalFreeDeleter {
+    // operator() 오버로딩: unique_ptr가 소멸될 때 이 함수가 호출됩니다.
+    void operator()(LPTSTR p) const {
+        if (p) {
+            LocalFree(p);
+        }
+    }
+};
+
+// DLL 파일 로드에 대한 커스텀 삭제자
+// std::unique_ptr에 등록되어 HMODULE을 자동으로 해제합니다.
+struct DllModuleDeleter {
+    void operator()(HMODULE hDll) const {
+        if (hDll != NULL) {
+            FreeLibrary(hDll);
+        }
+    }
+};
+
+// CRITICAL_SECTION을 위한 사용자 정의 삭제자
+// std::unique_ptr이 CRITICAL_SECTION 객체를 소멸할 때
+// DeleteCriticalSection을 자동으로 호출하게 합니다.
+struct CriticalSectionDeleter {
+    void operator()(LPCRITICAL_SECTION cs) const {
+        if (cs != nullptr) {
+            ::DeleteCriticalSection(cs);
+        }
+    }
+};
+
+#ifdef ENABLE_OPENGL
+
+// OpenGL 계열 명시적 소멸자
+struct ShaderObject
+{
+    GLuint id = 0; // OpenGL 셰이더 ID
+    GLenum type = 0; // 셰이더 타입 (GL_VERTEX_SHADER, GL_FRAGMENT_SHADER 등)
+    tstring name; // 셰이더의 이름 (선택 사항)
+
+    // 생성자: 셰이더 ID를 받아 초기화합니다.
+    // OpenGL 셰이더를 생성하는 glCreateShader는 이 생성자 외부에서 호출됩니다.
+    ShaderObject(GLuint shaderId, GLenum shaderType, const tstring& shaderName = _T(""))
+        : id(shaderId), type(shaderType), name(shaderName)
+    {
+        // std::cout << "DEBUG: ShaderObject constructed for ID: " << id << " (Type: " << type << ")" << std::endl;
+    }
+
+    // 복사 생성자 및 복사 대입 연산자 금지:
+    // ShaderObject는 단일 OpenGL 셰이더 자원을 소유하므로 복사될 수 없습니다.
+    ShaderObject(const ShaderObject&) = delete;
+    ShaderObject& operator=(const ShaderObject&) = delete;
+
+    // 이동 생성자 및 이동 대입 연산자 (기본 구현 사용)
+    // unique_ptr이 내부적으로 이동을 지원하므로, ShaderObject도 이동 가능해야 합니다.
+    ShaderObject(ShaderObject&&) = default;
+    ShaderObject& operator=(ShaderObject&&) = default;
+
+    // 소멸자: 이 ShaderObject가 파괴될 때 OpenGL 셰이더를 삭제합니다.
+    // unique_ptr이 이 ShaderObject를 해제하면 이 소멸자가 자동으로 호출됩니다.
+    ~ShaderObject()
+    {
+        if (id != NULL) { // 유효한 셰이더 ID인 경우에만 삭제
+            glDeleteShader(id);
+            // std::cout << "DEBUG: Shader ID " << id << " deleted by ShaderObject destructor." << std::endl;
+        }
+    }
+
+    // 셰이더 ID에 접근하는 Getter
+    GLuint GetID() const { return id; }
+    GLenum GetType() const { return type; }
+    const tstring& GetName() const { return name; }
+};
+
+// GLuint를 삭제할 사용자 정의 삭제자 구조체 정의
+// 프로그램 객체용 삭제자
+struct GLProgram
+{
+    GLuint id = 0; // OpenGL 프로그램 ID
+    tstring name; // 프로그램의 이름 (선택 사항)
+
+    // 생성자: 프로그램 ID를 받아 초기화합니다.
+    // glCreateProgram은 이 생성자 외부에서 호출되거나, 이 생성자 안에서 호출될 수도 있습니다.
+    // 여기서는 외부에서 ID를 받아 초기화합니다.
+    GLProgram(GLuint programId, const tstring& programName = _T(""))
+        : id(programId), name(programName)
+    {
+    }
+
+    // **복사 생성자 및 복사 대입 연산자 금지:**
+    // GLProgram은 단일 OpenGL 자원을 소유하므로 복사될 수 없습니다.
+    GLProgram(const GLProgram&) = delete;
+    GLProgram& operator=(const GLProgram&) = delete;
+
+    // **이동 생성자 및 이동 대입 연산자 (기본 구현 사용):**
+    // std::unique_ptr이 내부적으로 이동을 지원하므로, GLProgram도 이동 가능해야 합니다.
+    // C++11 이후에는 명시적으로 default 하는 것이 좋은 습관입니다.
+    GLProgram(GLProgram&&) = default;
+    GLProgram& operator=(GLProgram&&) = default;
+
+    // **소멸자:** 이 GLProgram 객체가 파괴될 때 OpenGL 프로그램 자원을 삭제합니다.
+    // unique_ptr이 이 GLProgram 객체를 delete하면 이 소멸자가 자동으로 호출됩니다.
+    ~GLProgram()
+    {
+        if (id != NULL) { // 유효한 프로그램 ID인 경우에만 삭제
+            glDeleteProgram(id);
+        }
+    }
+
+    // 프로그램 ID에 접근하는 Getter
+    GLuint GetID() const { return id; }
+    const tstring& GetName() const { return name; }
+};
+
+
+// HGLRC를 담는 구조체 (Wrapper Class) 정의
+struct ManagedGLRC {
+    HGLRC hGlrc = nullptr;
+
+    // 생성자: HGLRC 값을 받아 초기화합니다.
+    ManagedGLRC(HGLRC contextHandle) : hGlrc(contextHandle) {
+    }
+
+    // 복사 금지 (단일 자원 소유)
+    ManagedGLRC(const ManagedGLRC&) = delete;
+    ManagedGLRC& operator=(const ManagedGLRC&) = delete;
+
+    // 이동 허용 (unique_ptr과 함께 사용)
+    ManagedGLRC(ManagedGLRC&&) = default;
+    ManagedGLRC& operator=(ManagedGLRC&&) = default;
+
+    // 소멸자: 객체가 파괴될 때 wglMakeCurrent(NULL, NULL) 호출 후 wglDeleteContext 호출
+    ~ManagedGLRC() {
+        if (hGlrc) {
+            // 중요: 이 컨텍스트가 현재 스레드에 바인딩되어 있다면 해제해야 합니다.
+            // 일반적으로 컨텍스트를 삭제하는 스레드에서 해당 컨텍스트가 make current 된 상태여서는 안 됩니다.
+            // 또는 명시적으로 wglMakeCurrent(NULL, NULL)을 호출하여 해제한 후 삭제합니다.
+            // 여기서는 안전하게 해제를 시도합니다.
+            if (wglGetCurrentContext() == hGlrc) {
+                wglMakeCurrent(nullptr, nullptr);
+            }
+
+            if (hGlrc) {
+                wglDeleteContext(hGlrc);
+            }
+        }
+    }
+
+    // HGLRC 값에 접근하는 Getter
+    HGLRC get() const { return hGlrc; }
+
+    // bool 컨버전 (if (myGLRC))를 가능하게 함
+    operator bool() const { return hGlrc != nullptr; }
+};
+
+
+// GLuint VAO ID를 멤버로 가지는 구조체 (Wrapper Class) 정의
+// 이 구조체가 OpenGL VAO의 "소유권"을 나타냅니다.
+struct GLVertexArray
+{
+    GLuint id = 0; // OpenGL VAO ID
+
+    // 생성자: VAO ID를 받아 초기화합니다.
+    GLVertexArray(GLuint vaoId) : id(vaoId) {
+    }
+
+    // 복사 금지 (단일 자원 소유)
+    GLVertexArray(const GLVertexArray&) = delete;
+    GLVertexArray& operator=(const GLVertexArray&) = delete;
+
+    // 이동 허용 (unique_ptr과 함께 사용)
+    GLVertexArray(GLVertexArray&&) = default;
+    GLVertexArray& operator=(GLVertexArray&&) = default;
+
+    // 소멸자: 이 GLVertexArray 객체가 파괴될 때 OpenGL VAO 자원을 삭제합니다.
+    // unique_ptr이 이 GLVertexArray 객체를 delete하면 이 소멸자가 자동으로 호출됩니다.
+    ~GLVertexArray()
+    {
+        if (id != 0) { // 유효한 VAO ID인 경우에만 삭제
+            glDeleteVertexArrays(1, &id); // glDeleteVertexArrays는 배열을 받으므로 &id 사용
+        }
+    }
+
+    // VAO ID에 접근하는 Getter
+    GLuint GetID() const { return id; }
+
+    // bool 컨버전 (if (myVao))를 가능하게 함
+    operator bool() const { return id != 0; }
+};
+
+
+// GLuint Buffer ID를 멤버로 가지는 구조체 (Wrapper Class) 정의
+// 이 구조체가 OpenGL Buffer Object의 "소유권"을 나타냅니다.
+struct GLBuffer
+{
+    GLuint id = 0; // OpenGL Buffer Object ID
+    GLenum type = 0; // 버퍼의 타입 (GL_ARRAY_BUFFER, GL_ELEMENT_ARRAY_BUFFER 등)
+
+    // 생성자: Buffer ID와 타입을 받아 초기화합니다.
+    GLBuffer(GLuint bufferId, GLenum bufferType) : id(bufferId), type(bufferType) {
+    }
+
+    // 복사 금지 (단일 자원 소유)
+    GLBuffer(const GLBuffer&) = delete;
+    GLBuffer& operator=(const GLBuffer&) = delete;
+
+    // 이동 허용 (unique_ptr과 함께 사용)
+    GLBuffer(GLBuffer&&) = default;
+    GLBuffer& operator=(GLBuffer&&) = default;
+
+    // 소멸자: 이 GLBuffer 객체가 파괴될 때 OpenGL Buffer Object 자원을 삭제합니다.
+    // unique_ptr이 이 GLBuffer 객체를 delete하면 이 소멸자가 자동으로 호출됩니다.
+    ~GLBuffer()
+    {
+        if (id != 0) { // 유효한 Buffer ID인 경우에만 삭제
+            glDeleteBuffers(1, &id); // glDeleteBuffers는 배열을 받으므로 &id 사용
+        }
+    }
+
+    // Buffer ID에 접근하는 Getter
+    GLuint GetID() const { return id; }
+    GLenum GetType() const { return type; }
+
+    // bool 컨버전 (if (myVBO))를 가능하게 함
+    operator bool() const { return id != 0; }
+};
+
+
+// GLuint Texture ID를 멤버로 가지는 구조체 (Wrapper Class) 정의
+// 이 구조체가 OpenGL Texture Object의 "소유권"을 나타냅니다.
+struct GLTexture
+{
+    GLuint id = 0; // OpenGL Texture ID
+    GLenum target = 0; // 텍스처 타겟 (GL_TEXTURE_2D, GL_TEXTURE_CUBE_MAP 등) (선택 사항)
+
+    // 생성자: Texture ID와 선택적으로 타겟을 받아 초기화합니다.
+    GLTexture(GLuint textureId, GLenum textureTarget = 0)
+        : id(textureId), target(textureTarget)
+    {
+    }
+
+    // 복사 금지 (단일 자원 소유)
+    GLTexture(const GLTexture&) = delete;
+    GLTexture& operator=(const GLTexture&) = delete;
+
+    // 이동 허용 (unique_ptr과 함께 사용)
+    GLTexture(GLTexture&&) = default;
+    GLTexture& operator=(GLTexture&&) = default;
+
+    // 소멸자: 이 GLTexture 객체가 파괴될 때 OpenGL Texture Object 자원을 삭제합니다.
+    // unique_ptr이 이 GLTexture 객체를 delete하면 이 소멸자가 자동으로 호출됩니다.
+    ~GLTexture()
+    {
+        if (id != 0) { // 유효한 Texture ID인 경우에만 삭제
+            glDeleteTextures(1, &id); // glDeleteTextures는 배열을 받으므로 &id 사용
+        }
+    }
+
+    // Texture ID에 접근하는 Getter
+    GLuint GetID() const { return id; }
+    GLenum GetTarget() const { return target; } // 타겟 필요 시
+
+    // bool 컨버전 (if (myTexture))를 가능하게 함
+    operator bool() const { return id != 0; }
+};
+#endif // ENABLE_OPENGL
+
+#ifdef ENABLE_SOCKET
+// Socket을 정리할 커스텀 삭제자 함수
+// 이 함수 객체가 unique_ptr의 삭제자 역할을 합니다.
+struct SocketDeleter {
+    // std::unique_ptr에게 '포인터' 타입이 SOCKET 값임을 명시적으로 알려줍니다.
+    using pointer = SOCKET;
+
+    void operator()(SOCKET listenSock) const {
+        if (listenSock != INVALID_SOCKET) {
+            closesocket(listenSock);
+        }
+    }
+};
+
+// 1. 소켓 리소스를 추상화한 구조체
+struct SocketResource {
+    SOCKET hSock;
+
+    // 생성 시 소켓 할당
+    SocketResource(SOCKET s) : hSock(s) {}
+
+    // 소멸 시 자동 closesocket 호출
+    ~SocketResource() {
+        if (hSock != INVALID_SOCKET) {
+            closesocket(hSock);
+        }
+    }
+};
+
+// --- 윈속 초기화/정리 커스텀 삭제자 추가 ---
+// WSAStartup()과 WSACleanup()을 관리하는 삭제자입니다.
+// WSAData* 포인터를 관리하며, 소멸 시 WSACleanup()을 호출합니다.
+struct WinsockDeleter {
+    void operator()(WSADATA* pWsaData) const {
+        if (pWsaData) {
+            WSACleanup();
+        }
+    }
+};
+
+struct WSAEventValueDeleter {
+    using pointer = WSAEVENT;
+    void operator()(WSAEVENT h) const {
+        if (h && h != WSA_INVALID_EVENT) {
+            WSACloseEvent(h);
+        }
+    }
+};
+
+#ifdef ENABLE_ICMP
+// 1. IcmpCloseHandle 함수를 래핑하는 커스텀 삭제자 구조체 정의
+struct IcmpHandleDeleter {
+    // 함수 호출 연산자 오버로드:
+    // 이 객체가 삭제자 역할을 수행할 때 호출됩니다.
+    void operator()(HANDLE handle) const {
+        if (handle != INVALID_HANDLE_VALUE) {
+            // 실제 리소스를 해제하는 API 함수 호출
+            IcmpCloseHandle(handle);
+        }
+    }
+};
+#endif
+
+#endif // ENABLE_SOCKET
+
+
+// using 관련: 타입에 따른 스마트 포인터 선언을 미리 지정
+
+// LPLOGPALETTE (LOGPALETTE*)를 관리할 스마트 포인터 타입 정의
+// T* 타입의 포인터를 관리하는 unique_ptr에 MallocDeleter를 붙입니다.
+using UniqueLogPalette = std::unique_ptr<LOGPALETTE, MallocDeleter>;
+
+// 모든 GDI 핸들 타입(HFONT, HBRUSH, HPEN 등)을 위한 일반적인 UniqueGdiPtr 타입
+// T_Handle: HFONT, HBRUSH 등 실제 GDI 핸들 타입
+template <typename T_Handle>
+using UniqueGdiPtr = std::unique_ptr<T_Handle, GdiObjectDeleter>;
+
+// HFONT를 관리하는 스마트 포인터 타입
+using UniqueHFont = UniqueGdiPtr<std::remove_pointer<HFONT>::type>;
+
+// HPEN을 관리하는 스마트 포인터 타입
+using UniqueHPen = UniqueGdiPtr<std::remove_pointer<HPEN>::type>;
+
+// HBRUSH를 관리하는 스마트 포인터 타입
+using UniqueHBrush = UniqueGdiPtr<std::remove_pointer<HBRUSH>::type>;
+
+// HBITMAP을 관리하는 스마트 포인터 타입
+using UniqueHBitmap = UniqueGdiPtr<std::remove_pointer<HBITMAP>::type>;
+
+// HPALETTE를 관리하는 스마트 포인터 타입
+using UniqueHPalette = UniqueGdiPtr<std::remove_pointer<HPALETTE>::type>;
+
+
+// HDC를 관리하는 스마트 포인터 타입 (윈도우 핸들 필요)
+// 이 타입은 생성 시 윈도우 핸들을 전달해야 하므로, 직접 생성자를 호출해야 합니다.
+// 예: UniqueHdc hdc_ptr(::GetDC(hWnd), HdcDeleter(hWnd));
+using UniqueHdc = std::unique_ptr<std::remove_pointer<HDC>::type, HdcDeleter>;
+
+// HANDLE 타입의 Using
+using UniqueHandle = std::unique_ptr<std::remove_pointer<HANDLE>::type, HandleDeleter>;
+
+// FormatMessage()의 반환 타입인 LPWSTR을 관리하는 스마트 포인터 타입 정의입니다.
+// 이 타입은 LocalFreeDeleter를 사용하여 메모리를 해제합니다.
+using UniqueLocalFreePtr = std::unique_ptr<TCHAR, LocalFreeDeleter>;
+
+// HMODULE을 관리할 스마트 포인터 타입 정의
+using UniqueDllModule = std::unique_ptr<std::remove_pointer<HMODULE>::type, DllModuleDeleter>;
+
+// CRITICAL_SECTION을 위한 스마트 포인터 타입
+using UniqueCriticalSection = std::unique_ptr<CRITICAL_SECTION, CriticalSectionDeleter>;
+
+#ifdef ENABLE_OPENGL
+
+// OpenGLShader 타입의 Using
+using UniqueShader = unique_ptr<ShaderObject>;
+
+// GLuint를 관리할 스마트 포인터 타입 정의(프로그램 객체용)
+// 람다를 삭제자로 사용할 때는 decltype을 사용하여 람다의 타입을 지정합니다.
+// GLuint는 사실상 unsigned int 타입입니다.
+using UniqueGLProgram = unique_ptr<GLProgram>;
+
+// HGLRC를 관리할 스마트 포인터 타입 (이제 기본 삭제자 사용 가능)
+using UniqueGLRC = unique_ptr<ManagedGLRC>;
+
+// GLVertexArray 객체를 관리할 unique_ptr 타입 정의
+// 이제 unique_ptr은 GLVertexArray*를 관리합니다.
+// GLVertexArray 자체에 소멸자가 있으므로, unique_ptr에는 기본 삭제자(delete 연산자)를 사용합니다.
+using UniqueGLVertexArray = unique_ptr<GLVertexArray>;
+
+// GLBuffer 객체를 관리할 unique_ptr 타입 정의
+// 이제 unique_ptr은 GLBuffer*를 관리합니다.
+// GLBuffer 자체에 소멸자가 있으므로, unique_ptr에는 기본 삭제자(delete 연산자)를 사용합니다.
+using UniqueGLBuffer = unique_ptr<GLBuffer>;
+
+// GLTexture 객체를 관리할 unique_ptr 타입 정의
+// 이제 unique_ptr은 GLTexture*를 관리합니다.
+// GLTexture 자체에 소멸자가 있으므로, unique_ptr에는 기본 삭제자(delete 연산자)를 사용합니다.
+using UniqueGLTexture = unique_ptr<GLTexture>;
+
+#endif // ENABLE_OPENGL
+
+
+#ifdef ENABLE_SOCKET
+
+// 올바른 `unique_ptr` 타입 정의
+// 관리 대상: SOCKET (정수형 핸들)
+// 삭제자: SocketDeleter 구조체
+using UniqueSock = std::unique_ptr<SOCKET, SocketDeleter>;
+using SharedSock = std::shared_ptr<SocketResource>;
+
+// 윈속 초기화 자원을 관리할 unique_ptr 타입
+using UniqueWinsock = std::unique_ptr<WSADATA, WinsockDeleter>;
+
+using UniqueWSAEvent = std::unique_ptr<std::remove_pointer_t<WSAEVENT>, WSAEventValueDeleter>;
+
+#ifdef ENABLE_ICMP
+// HANDLE 타입을 관리하며, IcmpHandleDeleter를 삭제자로 사용하는 unique_ptr
+using UniqueIcmpSmartHandle = std::unique_ptr<std::remove_pointer<HANDLE>::type, IcmpHandleDeleter>;
+#endif
+
+#endif // ENABLE_SOCKET
+
+
+
+// GDI HDC 관련 안전해제 클래스(스마트 포인터 기술 아님)
+// SelectObject의 상태를 관리하고 자동으로 복원하는 RAII 래퍼
+// 이 클래스는 HDC에 GDI 객체를 선택하고, 소멸 시 이전에 선택되어 있던 객체를 자동으로 복원합니다.
+class GdiObjectSelector {
+public:
+    // 생성자: HDC에 hNewObject를 선택하고, 이전에 선택되어 있던 객체를 m_hOldObject에 저장합니다.
+    GdiObjectSelector(HDC hdc, HGDIOBJ hNewObject)
+        : m_hdc(hdc), m_hOldObject(nullptr)
+    {
+        // 생성자에서 초기 선택을 수행
+        if (m_hdc && hNewObject) {
+            m_hOldObject = ::SelectObject(m_hdc, hNewObject);
+        }
+    }
+
+    // 소멸자: m_hOldObject에 저장된 이전 객체를 다시 HDC에 선택하여 상태를 복원합니다.
+    ~GdiObjectSelector() {
+        // 소멸자에서 복원
+        if (m_hdc && m_hOldObject) {
+            ::SelectObject(m_hdc, m_hOldObject); // 원래 객체로 복원
+        }
+    }
+
+    // 복사 생성자 및 복사 할당 연산자 삭제 (소유권 개념이므로 복사 불가)
+    GdiObjectSelector(const GdiObjectSelector&) = delete;
+    GdiObjectSelector& operator=(const GdiObjectSelector&) = delete;
+
+    // reset 메서드:
+    // 1. 현재 GdiObjectSelector가 관리하던 HDC의 상태를 원래대로 복원합니다.
+    // 2. (선택적으로) hNewObject를 HDC에 새로 선택하고, 그 결과로 반환되는 이전 객체를 저장합니다.
+    // hNewObject: 새로 선택할 GDI 객체. nullptr이면 현재 객체만 복원하고 아무것도 새로 선택하지 않습니다.
+    void reset(HGDIOBJ hNewObject = nullptr) {
+        // 1. 현재 m_hOldObject에 저장된 (이전에 선택되어 있던) 객체를 HDC에 복원합니다.
+        //    이것이 현재 SelectObjectSelector가 관리하던 "상태"를 해제하는 과정입니다.
+        if (m_hdc && m_hOldObject) {
+            ::SelectObject(m_hdc, m_hOldObject);
+        }
+
+        // 2. 새로운 객체를 HDC에 선택하고, 그 결과로 반환되는 (새로운) 이전 객체를 m_hOldObject에 저장합니다.
+        //    이것이 새로운 "상태"를 획득하는 과정입니다.
+        m_hOldObject = nullptr; // m_hOldObject를 초기화
+        if (m_hdc && hNewObject) {
+            m_hOldObject = ::SelectObject(m_hdc, hNewObject);
+        }
+    }
+
+    // 현재 GdiObjectSelector가 관리하고 있는 (즉, 소멸 시 복원될) 이전 객체의 핸들을 반환
+    // (디버깅이나 특정 고급 시나리오에서 유용할 수 있습니다.)
+    HGDIOBJ get_old_object() const {
+        return m_hOldObject;
+    }
+
+private:
+    HDC m_hdc;          // 이 객체가 관리하는 HDC
+    HGDIOBJ m_hOldObject; // HDC에 이전에 선택되어 있던 GDI 객체 (소멸 시 복원될 객체)
+};
+
+// PAINTSTRUCT와 HDC를 함께 관리하는 헬퍼 클래스
+class PaintGuard {
+public:
+    // 생성자: BeginPaint를 호출하고 PAINTSTRUCT와 HDC를 저장
+    PaintGuard(HWND hWnd) : m_hWnd(hWnd) {
+        m_hdc = BeginPaint(m_hWnd, &m_ps);
+    }
+
+    // 소멸자: EndPaint를 호출하여 자원 해제
+    ~PaintGuard() {
+        if (m_hdc) {
+            EndPaint(m_hWnd, &m_ps);
+        }
+    }
+
+    // HDC를 반환하는 연산자 오버로딩 (HDC처럼 사용할 수 있게)
+    operator HDC() const {
+        return m_hdc;
+    }
+
+    // PAINTSTRUCT에 대한 포인터를 반환
+    PAINTSTRUCT* GetPaintStruct() {
+        return &m_ps;
+    }
+
+    // 유효한 HDC인지 확인
+    bool IsValid() const {
+        return m_hdc != NULL;
+    }
+
+private:
+    HWND m_hWnd;
+    PAINTSTRUCT m_ps;
+    HDC m_hdc;
+
+    // 복사 및 할당 금지 (RAII 객체는 보통 단일 소유권을 가짐)
+    PaintGuard(const PaintGuard&) = delete;
+    PaintGuard& operator=(const PaintGuard&) = delete;
+};
+
+// CriticalSection의 락을 자동으로 관리하는 RAII 래퍼
+class CriticalSectionLocker {
+public:
+    // 생성자: CriticalSection에 진입(Enter)
+    explicit CriticalSectionLocker(CRITICAL_SECTION& cs) : m_cs(cs) {
+        ::EnterCriticalSection(&m_cs);
+    }
+
+    // 소멸자: CriticalSection에서 벗어남(Leave)
+    ~CriticalSectionLocker() {
+        ::LeaveCriticalSection(&m_cs);
+    }
+
+    // 복사 및 이동 금지 (단일 스코프 소유권)
+    CriticalSectionLocker(const CriticalSectionLocker&) = delete;
+    CriticalSectionLocker& operator=(const CriticalSectionLocker&) = delete;
+
+private:
+    CRITICAL_SECTION& m_cs; // 참조로 CriticalSection 객체 저장
+};
+
+
+// -------------------------------------------------------------------------
+// 열거형 증가/감소 연산자 템플릿을 위한 헬퍼 함수 및 특성
+// -------------------------------------------------------------------------
+namespace EnumOperators {
+
+    // 각 열거형에 대해 시작 및 끝 값을 제공하는 특성(traits) 구조체.
+    // 사용자가 이 템플릿을 특수화(specialize)해야 합니다.
+    template<typename E, typename Enable = void>
+    struct EnumTraits;
+
+    // EnumTraits 특수화 예시 (아래에서 실제 열거형에 대해 구현)
+    // template<> struct EnumTraits<MyEnum> {
+    //     static constexpr MyEnum first = MyEnum::Value1;
+    //     static constexpr MyEnum last = MyEnum::ValueN; // 마지막 유효 값
+    // };
+
+
+    // 전위 증가 연산자 템플릿
+    template<typename E>
+    // std::enable_if_t<std::is_enum_v<E>>를 사용하여 E가 열거형 타입일 때만 이 함수가 유효하도록 제약
+    // C++20부터는 `requires std::is_enum<E>::value` 로 더 깔끔하게 가능
+    inline E& operator++(E& e) {
+        // E의 기본 정수 타입을 얻음
+        using U = std::underlying_type_t<E>;
+
+        // 현재 값을 기본 정수 타입으로 변환 후 1 증가
+        U val = static_cast<U>(e) + 1;
+
+        // EnumTraits가 정의되어 있고, 마지막 값을 넘어섰는지 확인하여 순환 처리
+        // E가 EnumTraits에 특수화되지 않았다면 컴파일 에러 발생
+        if (val > static_cast<U>(EnumOperators::EnumTraits<E>::last)) {
+            e = EnumOperators::EnumTraits<E>::first;
+        }
+        else {
+            e = static_cast<E>(val);
+        }
+        return e;
+    }
+
+    // 후위 증가 연산자 템플릿
+    template<typename E>
+    inline E operator++(E& e, int) {
+        E temp = e; // 현재 값 저장
+        ++e;        // 전위 증가 연산자 호출
+        return temp; // 이전 값 반환
+    }
+
+    // enum class 에서 감소에 대한 필요성이 없어서 주석처리
+    // 필요시 해제 해서 사용 하지만 극구 말리고 싶음...
+    /*
+    // 전위 감소 연산자 템플릿
+    template<typename E>
+    inline E& operator--(E& e) {
+        using U = std::underlying_type_t<E>;
+        U val = static_cast<U>(e) - 1;
+
+        if (val < static_cast<U>(EnumOperators::EnumTraits<E>::first)) {
+            e = EnumOperators::EnumTraits<E>::last;
+        }
+        else {
+            e = static_cast<E>(val);
+        }
+        return e;
+    }
+
+    // 후위 감소 연산자 템플릿
+    template<typename E>
+    inline E operator--(E& e, int) {
+        E temp = e;
+        --e;
+        return temp;
+    }
+    */
+
+} // namespace EnumOperators
+
+/*
+// 열거형 증감 연산자 구현 예시
+// enLighting_Mode에 대한 EnumTraits 특수화
+namespace EnumOperators { // 반드시 EnumOperators 네임스페이스 안에
+    template<>
+    struct EnumTraits<CMyOpenGL::enLighting_Mode> {
+        static constexpr CMyOpenGL::enLighting_Mode first = CMyOpenGL::enLighting_Mode::AMBIENT;
+        static constexpr CMyOpenGL::enLighting_Mode last = CMyOpenGL::enLighting_Mode::END_DEMO;
+    };
+}
+
+using namespace EnumOperators;
+*/
+
+#endif // SSLEGACING_H
